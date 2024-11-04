@@ -10,7 +10,6 @@
 ;; ========== TOKEN DEFINITIONS ==========
 (define-non-fungible-token boom-nft uint)
 
-
 ;; ========== Constants ==========
 ;; Core error codes
 (define-constant contract-owner tx-sender)
@@ -20,11 +19,7 @@
 (define-constant ERR-LIST-FULL (err u405))
 (define-constant ERR-INVALID-PRINCIPAL (err u406))
 (define-constant ERR-OWNER-ONLY (err u407))
-
-
-;; Role error codes
-(define-constant ERR-ONLY-OWNER (err u1000))
-(define-constant ERR-ONLY-MANAGER (err u1001))
+(define-constant ERR-MANAGER-VALIDATION-FAILED (err u408))
 
 ;; Product error codes
 (define-constant ERR-PRODUCT-NOT-FOUND (err u2000))
@@ -35,6 +30,7 @@
 (define-constant ERR-PRODUCT-UPDATE-FAILED (err u2005))
 (define-constant ERR-PRODUCT-REMOVE-FAILED (err u2006))
 (define-constant ERR-INVENTORY-UPDATE-FAILED (err u2007))
+(define-constant ERR-ORDER-CREATE-FAILED (err u2008))
 
 ;; Order error codes
 (define-constant ERR-ORDER-NOT-FOUND (err u3000))
@@ -42,6 +38,10 @@
 (define-constant ERR-INSUFFICIENT-INVENTORY (err u3002))
 (define-constant ERR-INVALID-QUANTITY (err u3003))
 (define-constant ERR-PLACE-ORDER-FAILED (err u3004))
+(define-constant ORDER-STATUS-PENDING "PENDING")
+(define-constant ORDER-STATUS-CANCELLED "CANCELLED")
+(define-constant ORDER-STATUS-COMPLETED "COMPLETED")
+(define-constant ERR-CANCEL-ORDER-FAILED (err u3005))
 
 ;; Input validation error codes
 (define-constant ERR-INVALID-INPUT (err u4000))
@@ -50,42 +50,34 @@
 ;; Log error codes
 (define-constant ERR-LOG-VALIDATION-FAILED (err u5000))
 (define-constant ERR-LOG-STORE-UPDATE-FAILED (err u5001))
-(define-constant ERR-LOG-PRODUCT-FAILED (err u5002))
-(define-constant ERR-LOG-ORDER-FAILED (err u5003))
-(define-constant ERR-LOG-INVENTORY-FAILED (err u5004))
-(define-constant ERR-LOG-DISCOUNT-FAILED (err u5005))
-(define-constant ERR-LOG-NFT-FAILED (err u5006))
-(define-constant ERR-MANAGER-ADD-FAILED (err u5007))
-(define-constant ERR-MANAGER-REMOVE-FAILED (err u5008))
+(define-constant ERR-ORDER-PARAM-VALIDATION-FAILED (err u5007))
+(define-constant ERR-MANAGER-ADD-FAILED (err u5008))
+(define-constant ERR-MANAGER-REMOVE-FAILED (err u5009))
 
 ;; NFT error codes
 (define-constant ERR-NFT-NOT-ENABLED (err u6000))
 (define-constant ERR-NFT-NOT-WHITELISTED (err u6001))
-(define-constant ERR-NFT-INVALID-TOKEN-ID (err u6002))
-(define-constant ERR-NFT-INVALID-OWNER (err u6003))
-(define-constant ERR-NFT-INVALID-RECIPIENT (err u6004))
 (define-constant ERR-NFT-MINT-FAILED (err u6005))
-(define-constant ERR-NFT-TRANSFER-FAILED (err u6006))
-(define-constant ERR-NFT-BURN-FAILED (err u6007))
-(define-constant ERR-NFT-MINTING-ORDER-FAILED (err u6008))
 (define-constant ERR-INVALID-CONTRACT (err u6009))
 (define-constant ERR-NOT-TOKEN-OWNER (err u6010))
 (define-constant ERR-INVALID-TOKEN (err u6011))
-(define-constant ERR-LOG-MINT-FAILED (err u6012))
 (define-constant ERR-NFT-CONTRACT-UPDATE (err u6013))
-(define-constant ERR-NFT-CONFIG-UPDATE (err u6014))
-(define-constant ERR-INVALID-NFT-CONTRACT (err u6015))
 (define-constant ERR-NFT-NOT-FOUND (err u6016))
 (define-constant ERR-INVALID-URI (err u6017))
-(define-constant ERR-URI-UPDATE-FAILED (err u6018))
 (define-constant ERR-INVALID-URI-FORMAT (err u6019))
+(define-constant ERR-MINT-NFT-ORDER-FAILED (err u6020))
+(define-constant ERR-NFT-DISABLE-FAILED (err u6021))
+(define-constant ERR-NFT-CONFIG-SET-FAILED (err u6022))
+(define-constant ERR-MINT-NFT-FAILED (err u6023))
+(define-constant ERR-NFT-TOKEN-NOT-FOUND (err u6024))
 
 ;; Discount error codes
 (define-constant ERR-DISCOUNT-NOT-FOUND (err u7000))
-(define-constant ERR-DISCOUNT-EXPIRED (err u7001))
 (define-constant ERR-INVALID-DISCOUNT (err u7002))
 (define-constant ERR-INVALID-DISCOUNT-ID (err u7003))
-(define-constant ERR-DISCOUNT-FAILED (err u7004))
+(define-constant ERR-DISCOUNT-ADD-FAILED (err u7005))
+(define-constant ERR-DISCOUNT-UPDATE-FAILED (err u7006))
+(define-constant ERR-DISCOUNT-DEACTIVATE-FAILED (err u7007))
 
 ;; Buyer error codes
 (define-constant ERR-INVALID-BUYER (err u403))
@@ -140,6 +132,7 @@
     buyer: principal,
     status: (string-ascii 20),
     created-at: uint,
+    updated-at: uint
 })
 
 ;; Logging System
@@ -170,17 +163,12 @@
     enabled: bool
 })
 
+;; Product Discounts
+(define-map product-discounts uint uint)
+
 
 ;; ========== PRIVATE FUNCTIONS ==========
 ;; ========== List Management Functions ==========
-(define-private (add-to-product-list (id uint))
-    (let ((current-list (var-get product-ids)))
-        (begin 
-            (asserts! (< (len current-list) u200) ERR-LIST-FULL)
-            (asserts! (validate-id id) ERR-INVALID-ID)
-            (var-set product-ids (unwrap-panic (as-max-len? (append current-list id) u200)))
-            (ok true))))
-
 (define-private (add-to-order-list (id uint))
     (let ((current-list (var-get order-ids)))
         (begin
@@ -189,20 +177,21 @@
             (ok true))))
 
 ;; ========== List Functions ==========
-(define-private (fold-product-tuple (product-tuple {id: uint, price: uint, name: (string-ascii 50)})
-                                  (result (list 200 {id: uint, price: uint, name: (string-ascii 50)})))
-    (match (as-max-len? (append result product-tuple) u200)
-        success success
-        result))
+(define-private (is-product-active (id uint))
+    (match (map-get? products id)
+        product (get active product)
+        false))
 
 (define-private (fold-product (id uint) (result (list 200 {id: uint, price: uint, name: (string-ascii 50)})))
     (match (map-get? products id)
-        product (fold-product-tuple 
-            {
+        product (if (get active product)
+            (match (as-max-len? (append result {
                 id: id,
                 price: (get price product),
                 name: (get name product)
-            }
+            }) u200)
+                success success
+                result)
             result)
         result))
 
@@ -211,7 +200,11 @@
     (is-eq tx-sender contract-owner))
 
 (define-private (validate-principal (principal principal))
-    (not (is-eq principal 'SP000000000000000000002Q6VF78)))
+    (and 
+        (not (is-eq principal 'SP000000000000000000002Q6VF78))
+        (not (is-eq principal (as-contract tx-sender)))
+        (not (is-eq principal contract-owner))
+    ))
 
 (define-private (is-manager)
     (default-to false (map-get? managers tx-sender)))
@@ -221,13 +214,18 @@
 
 ;; ========== Input Validation Functions ==========
 (define-private (validate-price (price uint))
-    (> price u0))
+    (and 
+        (> price u0)  ;; Price must be greater than 0
+        (< price u1000000000000)  ;; Add reasonable upper limit, e.g. 1 trillion
+    ))
 
 (define-private (validate-string-not-empty (value (string-ascii 50)))
     (not (is-eq value "")))
 
 (define-private (validate-quantity (quantity uint))
-    (> quantity u0))
+    (and 
+        (> quantity u0)
+        (<= quantity u1000))) ;; Set reasonable upper limit
 
 (define-private (validate-id (id uint))
     (>= (var-get product-nonce) id))
@@ -242,11 +240,6 @@
         (not (is-eq value ""))
         (<= (len value) u100)))
 
-(define-private (validate-optional-description (description (optional (string-ascii 200))))
-    (match description
-        desc (validate-string-length-200 desc)
-        true))
-
 (define-private (validate-optional-string (value (optional (string-ascii 200))))
     (match value
         desc (validate-string-length-200 desc)
@@ -255,19 +248,8 @@
 (define-private (validate-token-id (token-id uint))
     (and 
         (> token-id u0)
-        (<= token-id (var-get last-token-id))))
-
-(define-private (validate-token-uri (uri (string-ascii 200)))
-    (begin
-        ;; Check for empty string
-        (asserts! (not (is-eq uri "")) ERR-INVALID-URI-FORMAT)
-        ;; Check minimum length for ipfs:// prefix
-        (asserts! (>= (len uri) u7) ERR-INVALID-URI-FORMAT)
-        ;; Validate prefix is ipfs://
-        (asserts! (is-eq (slice? uri u0 u7) (some "ipfs://")) ERR-INVALID-URI-FORMAT)
-        ;; Check remaining length after prefix
-        (asserts! (> (len uri) u7) ERR-INVALID-URI-FORMAT)
-        (ok true)))
+        (<= token-id (var-get last-token-id))
+        (is-some (nft-get-owner? boom-nft token-id))))
 
 (define-private (validate-product-id (id uint))
     (and 
@@ -276,65 +258,32 @@
             {active: false} 
             (map-get? products id)))))
 
+(define-private (validate-description (description (optional (string-ascii 200))))
+    (match description
+        desc (and (not (is-eq desc ""))
+                  (<= (len desc) u200))
+        true))
+
 ;; ========== Enhanced Order Processing ==========
-(define-private (apply-discount (price uint))
-    (ok price))
+(define-private (apply-discount (price uint) (discount-id uint))
+    (match (map-get? discounts discount-id)
+        discount (let (
+            (discount-amount (get amount discount))
+            (current-block block-height)
+        )
+        (if (and 
+            (get active discount)
+            (>= current-block (get start-block discount))
+            (<= current-block (get end-block discount)))
+            (let ((discount-value (/ (* price discount-amount) u100)))
+                (- price discount-value))
+            price))
+        price))
 
-(define-private (is-discount-active (discount (optional {
-    product-id: uint,
-    amount: uint,
-    start-block: uint,
-    end-block: uint,
-    active: bool
-})))
-    (match discount
-        d (and 
-            (get active d)
-            (>= block-height (get start-block d))
-            (<= block-height (get end-block d)))
-        false))
-
-(define-private (get-active-discount (product-id uint))
-    (let ((current-block block-height))
-        (match (map-get? discounts product-id)
-            discount (if (and 
-                            (get active discount)
-                            (>= current-block (get start-block discount))
-                            (<= current-block (get end-block discount)))
-                        (some discount)
-                        none)
-            none)))
-
-(define-private (check-discount (discount-id uint) (result (optional {
-        id: uint,
-        product-id: uint,
-        amount: uint,
-        start-block: uint,
-        end-block: uint,
-        active: bool,
-        created-at: uint,
-        updated-at: uint
-    })))
-    (let ((discount (map-get? discounts discount-id)))
-        (match discount
-            d (if (and 
-                (get active d)
-                (>= block-height (get start-block d))
-                (<= block-height (get end-block d)))
-                (some d)
-                result)
-            result)))
-
-(define-private (find-active-discount (product-id uint))
-    (let ((discount (map-get? discounts product-id)))
-        (match discount
-            d (if (and 
-                (get active d)
-                (>= block-height (get start-block d))
-                (<= block-height (get end-block d)))
-                (some d)
-                none)
-            none)))
+(define-private (validate-discount-id (discount-id uint))
+    (and 
+        (< discount-id (var-get discount-nonce))
+        (is-some (map-get? discounts discount-id))))
 
 ;; ========== Logging Functions ==========
 (define-private (add-log (action (string-ascii 50)) (details (string-ascii 200)))
@@ -347,44 +296,33 @@
                 timestamp: block-height
             })
             (var-set log-nonce (+ log-id u1))
-            (ok u1))))
+            (ok true))))
 
 ;; ========== Order Management ==========
 (define-private (create-order (order-id uint) (product-id uint) (quantity uint) (buyer principal))
     (begin
-        ;; Validate order parameters
         (asserts! (validate-id order-id) ERR-INVALID-ID)
-        (asserts! (validate-id product-id) ERR-INVALID-ID)
+        (asserts! (validate-product-id product-id) ERR-INVALID-ID)
         (asserts! (validate-quantity quantity) ERR-INVALID-QUANTITY)
-        (asserts! (not (is-eq buyer 'SP000000000000000000002Q6VF78)) ERR-INVALID-PARAMS)
+        (asserts! (validate-principal buyer) ERR-INVALID-PRINCIPAL)
         
-        ;; Get product and calculate price
         (let ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND)))
             (begin
-                ;; Log order validation
-                (unwrap! (add-log "validate" "Order parameters validated") ERR-LOG-VALIDATION-FAILED)
+                (unwrap! (add-log "validate" "Order parameters validated") ERR-ORDER-PARAM-VALIDATION-FAILED)
                 
-                ;; Create the order
                 (map-set orders order-id {
                     id: order-id,
                     product-id: product-id,
                     quantity: quantity,
                     buyer: buyer,
-                    status: "pending",
-                    created-at: block-height
+                    status: ORDER-STATUS-PENDING,
+                    created-at: block-height,
+                    updated-at: block-height
                 })
                 
-                ;; Add to order list
                 (try! (add-to-order-list order-id))
-                
-                ;; Log order creation
-                (unwrap! (add-log "create-order" "Order created") ERR-LOG-ORDER-FAILED)
-                
-                (ok true)
-            )
-        )
-    )
-)
+                (unwrap! (add-log "create-order" "Order created") ERR-ORDER-CREATE-FAILED)
+                (ok true)))))
 
 (define-private (fold-order-tuple (order-tuple {id: uint, product-id: uint, quantity: uint, buyer: principal, status: (string-ascii 20)})
                                 (result (list 200 {id: uint, product-id: uint, quantity: uint, buyer: principal, status: (string-ascii 20)})))
@@ -405,7 +343,6 @@
             result)
         result))
 
-;; NFT helper functions
 (define-private (mint-nft (recipient principal))
     (let ((token-id (+ (var-get last-token-id) u1)))
         (begin
@@ -413,43 +350,14 @@
             (var-set last-token-id token-id)
             (ok token-id))))
 
-(define-private (mint-product-nft (product-id uint) (recipient principal))
-    (let ((nft-data (map-get? product-nfts product-id)))
-        (match nft-data
-            data (begin
-                (asserts! (get enabled data) ERR-NFT-NOT-ENABLED)
-                (try! (as-contract (contract-call? .boom-nft mint recipient)))
-                (unwrap! (add-log "mint-nft" "NFT minted successfully") ERR-NFT-MINT-FAILED)
-                (ok true))
-            ERR-NFT-NOT-FOUND)))
-
-(define-private (is-whitelisted-nft (nft-contract principal))
-    (default-to false (map-get? nft-contracts nft-contract)))
-
-(define-private (is-whitelisted-contract (contract principal))
-    (default-to false (map-get? nft-contracts contract)))
-
-(define-private (is-valid-nft-contract (nft-contract <nft-trait>))
-    (contract-call? nft-contract get-last-token-id))
-
 (define-private (validate-uri-format (uri (string-ascii 200)))
     (let ((uri-len (len uri)))
         (and 
             (not (is-eq uri ""))  ;; not empty
-            (>= uri-len u7)       ;; minimum length
+            (>= uri-len u7)       ;; min length check
             (is-eq (slice? uri u0 u7) (some "ipfs://"))  ;; starts with ipfs://
             (<= uri-len u200)     ;; max length check
             (> uri-len u7))))  
-
-(define-private (validate-nft-contract (nft-contract principal))
-    (and 
-        ;; Not zero address
-        (not (is-eq nft-contract 'SP000000000000000000002Q6VF78))
-        ;; Not self
-        (not (is-eq nft-contract (as-contract tx-sender)))
-        ;; Must be whitelisted
-        (default-to false (map-get? nft-contracts nft-contract))))
-
 
 ;; ========== PUBLIC FUNCTIONS ==========
 ;; ========== Store Management ==========
@@ -460,7 +368,7 @@
         (banner (string-ascii 100)))
     (begin
         ;; Authorization check
-        (asserts! (is-owner) ERR-ONLY-OWNER)
+        (asserts! (is-owner) ERR-OWNER-ONLY)
         ;; Input validation
         (asserts! (validate-string-not-empty name) ERR-EMPTY-STRING)
         (asserts! (validate-string-length-200 description) ERR-INVALID-INPUT)
@@ -480,13 +388,14 @@
 
 ;; ========== Role Management ==========
 (define-public (add-manager (manager principal))
-    (begin
-        (asserts! (is-owner) ERR-NOT-AUTHORIZED)
-        (asserts! (not (is-eq manager tx-sender)) ERR-INVALID-PARAMS)
-        (unwrap! (add-log "validate" "Manager validated") ERR-LOG-VALIDATION-FAILED)
-        (map-set managers manager true)
-        (unwrap! (add-log "add-manager" "Manager added") ERR-MANAGER-ADD-FAILED)
-        (ok true)))
+  (begin
+    (asserts! (is-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (validate-principal manager) ERR-INVALID-PRINCIPAL)
+    (unwrap! (add-log "validate" "Manager validated") ERR-MANAGER-VALIDATION-FAILED)
+    (map-set managers manager true)
+    (unwrap! (add-log "add-manager" "Manager added") ERR-MANAGER-ADD-FAILED)
+    (ok true)))
+
 
 (define-public (remove-manager (manager principal))
     (begin
@@ -502,14 +411,19 @@
         (asserts! (can-manage) ERR-NOT-AUTHORIZED)
         (asserts! (validate-price price) ERR-INVALID-PRICE)
         (asserts! (validate-string-not-empty name) ERR-EMPTY-STRING)
-        (asserts! (validate-optional-description description) ERR-INVALID-INPUT)
+        
+        ;; Check if product with ID already exists
+        (asserts! (is-none (map-get? products id)) ERR-PRODUCT-ADD-FAILED)
+        
+        ;; Validate description
+        (asserts! (validate-description description) ERR-INVALID-INPUT)
         
         ;; Update nonce if needed
         (if (>= id (var-get product-nonce))
             (var-set product-nonce (+ id u1))
             true)
         
-        ;; Add product
+        ;; Add product with validated description
         (map-set products id {
             name: name,
             price: price,
@@ -519,6 +433,9 @@
             created-at: block-height,
             updated-at: block-height
         })
+        
+        ;; Add to product list
+        (try! (add-to-product-list id))
         
         (unwrap! (add-log "add-product" "Product added") ERR-PRODUCT-ADD-FAILED)
         (ok true)))
@@ -545,9 +462,7 @@
 (define-public (remove-product (id uint))
     (let ((existing-product (unwrap! (map-get? products id) ERR-PRODUCT-NOT-FOUND)))
         (begin
-            ;; Authorization check
             (asserts! (can-manage) ERR-NOT-AUTHORIZED)
-            ;; Validate ID
             (asserts! (validate-id id) ERR-INVALID-ID)
             
             ;; Update product status
@@ -581,24 +496,21 @@
 (define-public (place-order (product-id uint) (quantity uint) (buyer principal))
     (let (
         (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
-        (total-price (* (get price product) quantity))
         (order-id (var-get order-nonce))
-        (discounted-price (unwrap! (get-discounted-price product-id total-price) ERR-DISCOUNT-FAILED))
+        (current-block block-height)
     )
     (begin
-        ;; Validate order
+        ;; First validate the product exists and is active
         (asserts! (get active product) ERR-PRODUCT-INACTIVE)
+        ;; Then validate other inputs
+        (asserts! (validate-id product-id) ERR-INVALID-ID)
+        (asserts! (> quantity u0) ERR-INVALID-QUANTITY)
+        ;; Validate inventory
         (asserts! (>= (get inventory product) quantity) ERR-INSUFFICIENT-INVENTORY)
-        (asserts! (validate-quantity quantity) ERR-INVALID-QUANTITY)
-        
-        ;; Validate buyer
+        ;; Validate buyer principal
+        (asserts! (validate-principal buyer) ERR-INVALID-BUYER)
+        ;; Validate tx-sender is buyer
         (asserts! (is-eq tx-sender buyer) ERR-UNAUTHORIZED-BUYER)
-        
-        ;; Handle STX transfer with discounted price
-        (try! (stx-transfer? discounted-price tx-sender (as-contract tx-sender)))
-        
-        ;; Create order
-        (var-set order-nonce (+ order-id u1))
         
         ;; Store order
         (map-set orders order-id {
@@ -606,117 +518,152 @@
             product-id: product-id,
             quantity: quantity,
             buyer: buyer,
-            status: "pending",
-            created-at: block-height
+            status: ORDER-STATUS-PENDING,
+            created-at: current-block,
+            updated-at: current-block
         })
         
-        ;; Update inventory
-        (map-set products product-id (merge product {
-            inventory: (- (get inventory product) quantity),
-            updated-at: block-height
-        }))
-
         ;; Update order counter and list
         (var-set order-nonce (+ order-id u1))
         (try! (add-to-order-list order-id))
         
-        ;; Log the order
-        (unwrap! (add-log "place-order" "Order placed successfully") ERR-PLACE-ORDER-FAILED)
+        ;; Update inventory
+        (map-set products product-id (merge product {
+            inventory: (- (get inventory product) quantity),
+            updated-at: current-block
+        }))
+        
+        (unwrap! (add-log "place-order" "Order placed") ERR-PLACE-ORDER-FAILED)
         (ok true))))
 
-(define-public (cancel-order (id uint))
-    (let ((order (unwrap! (map-get? orders id) ERR-ORDER-NOT-FOUND)))
-        (begin
-            ;; Only allow the buyer or a manager to cancel the order
-            (asserts! (or (can-manage) (is-eq tx-sender (get buyer order))) ERR-NOT-AUTHORIZED)
-            ;; Only allow cancellation of pending orders
-            (asserts! (is-eq (get status order) "pending") ERR-INVALID-ORDER-STATUS)
-            
-            ;; Return inventory - add the quantity back
-            (try! (update-inventory 
-                (get product-id order) 
-                (+ (get inventory (unwrap! (map-get? products (get product-id order)) ERR-PRODUCT-NOT-FOUND))
-                   (get quantity order))))
+(define-public (mint-nft-for-order (order-id uint))
+    (let (
+        (order (unwrap! (map-get? orders order-id) ERR-ORDER-NOT-FOUND))
+        (product-id (get product-id order))
+        (buyer (get buyer order))
+        (nft-config (unwrap! (map-get? product-nfts product-id) ERR-NFT-NOT-FOUND))
+    )
+    (begin
+        ;; Verify NFT is enabled for this product
+        (asserts! (get enabled nft-config) ERR-NFT-NOT-ENABLED)
+        ;; Verify order status is PENDING
+        (asserts! (is-eq (get status order) ORDER-STATUS-PENDING) ERR-INVALID-ORDER-STATUS)
+        ;; Only owner can mint NFTs
+        (asserts! (is-owner) ERR-OWNER-ONLY)
+        
+        ;; Mint NFT
+        (let ((token-id (try! (mint-nft buyer))))
+            ;; Set token URI if provided
+            (match (get token-uri nft-config)
+                uri (map-set token-uris token-id uri)
+                true)
             
             ;; Update order status
-            (map-set orders id (merge order {
-                status: "cancelled"
+            (map-set orders order-id (merge order {
+                status: ORDER-STATUS-COMPLETED,
+                updated-at: block-height
             }))
             
-            ;; Log the cancellation
-            (unwrap! (add-log "cancel-order" "Order cancelled") ERR-LOG-ORDER-FAILED)
+            ;; Log the minting
+            (unwrap! (add-log "mint-nft" "NFT minted for order") ERR-MINT-NFT-FAILED)
             
-            (ok true))))
+            (ok (some buyer))))))
+
+(define-public (cancel-order (order-id uint))
+    (let (
+        (order (unwrap! (map-get? orders order-id) ERR-NOT-FOUND))
+        (current-block block-height)
+    )
+    (begin
+        ;; Authorization check
+        (asserts! (or 
+            (is-eq tx-sender (get buyer order))
+            (can-manage)
+        ) ERR-NOT-AUTHORIZED)
+        
+        ;; Status validation - can only cancel PENDING orders
+        (asserts! (is-eq (get status order) ORDER-STATUS-PENDING) ERR-INVALID-ORDER-STATUS)
+        
+        ;; Update order status with timestamps
+        (map-set orders order-id (merge order {
+            status: ORDER-STATUS-CANCELLED,
+            updated-at: current-block
+        }))
+        
+        ;; Log the cancellation
+        (unwrap! (add-log "cancel-order" "Order cancelled") ERR-CANCEL-ORDER-FAILED)
+        
+        (ok true))))
 
 ;; ========== Discount Management ==========
 (define-public (add-discount (product-id uint) (amount uint) (start-block uint) (end-block uint))
-    (let ((discount-id (var-get discount-nonce)))
-        (begin
-            (asserts! (can-manage) ERR-NOT-AUTHORIZED)
-            (asserts! (validate-id product-id) ERR-INVALID-ID)
-            (asserts! (< amount u100) ERR-INVALID-DISCOUNT)
-            (asserts! (>= end-block start-block) ERR-INVALID-DISCOUNT)
-            
-            ;; Log validation
-            (unwrap! (add-log "validate" "Discount parameters validated") ERR-LOG-VALIDATION-FAILED)
-            
-            ;; Add discount
+    (begin
+        (asserts! (can-manage) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (map-get? products product-id)) ERR-PRODUCT-NOT-FOUND)
+        (asserts! (and (> amount u0) (< amount u100)) ERR-INVALID-DISCOUNT)
+        (asserts! (>= end-block start-block) ERR-INVALID-DISCOUNT)
+        
+        (let ((discount-id (var-get discount-nonce)))
+            ;; Set the discount
             (map-set discounts discount-id {
                 id: discount-id,
-                amount: amount,
                 product-id: product-id,
+                amount: amount,
                 start-block: start-block,
                 end-block: end-block,
                 active: true,
                 created-at: block-height,
                 updated-at: block-height
             })
-            
+            ;; Map product-id to discount-id
+            (map-set product-discounts product-id discount-id)
+            ;; Add to discount IDs list
+            (var-set discount-ids (unwrap! (as-max-len? (append (var-get discount-ids) discount-id) u200) ERR-LIST-FULL))
             ;; Increment nonce
             (var-set discount-nonce (+ discount-id u1))
-            
             ;; Log addition
-            (unwrap! (add-log "add-discount" "Discount added") ERR-LOG-DISCOUNT-FAILED)
+            (unwrap! (add-log "add-discount" "Discount added") ERR-DISCOUNT-ADD-FAILED)
             (ok discount-id))))
 
-;; Update update-discount with validation
 (define-public (update-discount (discount-id uint) (amount uint) (end-block uint))
-    (let ((discount (unwrap! (map-get? discounts discount-id) ERR-DISCOUNT-NOT-FOUND)))
-        (begin
-            (asserts! (can-manage) ERR-NOT-AUTHORIZED)
-            (asserts! (< amount u100) ERR-INVALID-DISCOUNT)
-            (asserts! (>= end-block block-height) ERR-INVALID-DISCOUNT)
-            ;; Validate discount ID exists
-            (asserts! (< discount-id (var-get discount-nonce)) ERR-INVALID-DISCOUNT-ID)
-            
-            ;; Update discount
-            (map-set discounts discount-id (merge discount {
-                amount: amount,
-                end-block: end-block,
-                updated-at: block-height
-            }))
-            
-            ;; Log update
-            (unwrap! (add-log "update-discount" "Discount updated") ERR-LOG-DISCOUNT-FAILED)
-            (ok true))))
+    (begin
+        ;; Authorization check
+        (asserts! (can-manage) ERR-NOT-AUTHORIZED)
+        ;; Validate discount ID
+        (asserts! (validate-discount-id discount-id) ERR-INVALID-DISCOUNT-ID)
+        ;; Validate amount
+        (asserts! (< amount u100) ERR-INVALID-DISCOUNT)
+        ;; Validate end block
+        (asserts! (>= end-block block-height) ERR-INVALID-DISCOUNT)
+        
+        ;; Get existing discount after validation
+        (let ((existing-discount (unwrap! (map-get? discounts discount-id) ERR-DISCOUNT-NOT-FOUND)))
+            ;; Create updated discount data
+            (let ((updated-discount (merge existing-discount {
+                    amount: amount,
+                    end-block: end-block,
+                    updated-at: block-height
+                })))
+                ;; Update discount
+                (map-set discounts discount-id updated-discount)
+                ;; Log update
+                (unwrap! (add-log "update-discount" "Discount updated") ERR-DISCOUNT-UPDATE-FAILED)
+                (ok true)))))
 
-;; Update deactivate-discount with validation
-(define-public (deactivate-discount (discount-id uint))
-    (let ((discount (unwrap! (map-get? discounts discount-id) ERR-DISCOUNT-NOT-FOUND)))
-        (begin
-            (asserts! (can-manage) ERR-NOT-AUTHORIZED)
-            ;; Validate discount ID exists
-            (asserts! (< discount-id (var-get discount-nonce)) ERR-INVALID-DISCOUNT-ID)
-            
-            ;; Deactivate discount
-            (map-set discounts discount-id (merge discount {
-                active: false,
-                updated-at: block-height
-            }))
-            
-            ;; Log deactivation
-            (unwrap! (add-log "deactivate-discount" "Discount deactivated") ERR-LOG-DISCOUNT-FAILED)
-            (ok true))))
+(define-public (deactivate-discount (product-id uint))
+    (begin
+        (asserts! (can-manage) ERR-NOT-AUTHORIZED)
+        (let ((discount-id (map-get? product-discounts product-id)))
+            (asserts! (is-some discount-id) ERR-DISCOUNT-NOT-FOUND)
+            (let ((discount (unwrap! (map-get? discounts (unwrap-panic discount-id)) ERR-DISCOUNT-NOT-FOUND)))
+                (map-set discounts (unwrap-panic discount-id) (merge discount {
+                    active: false,
+                    updated-at: block-height
+                }))
+                ;; Remove product-discount mapping
+                (map-delete product-discounts product-id)
+                (unwrap! (add-log "deactivate-discount" "Discount deactivated") ERR-DISCOUNT-DEACTIVATE-FAILED)
+                (ok true)))))
 
 ;; Update transfer function with validation
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
@@ -746,67 +693,70 @@
             ;; Update last token ID
             (var-set last-token-id token-id)
             ;; Log the mint
-            (unwrap! (add-log "mint-nft" "NFT minted successfully") ERR-LOG-MINT-FAILED)
+            (unwrap! (add-log "mint-nft" "NFT minted successfully") ERR-NFT-MINT-FAILED)
             (ok token-id))))
 
-;; Add this function to the boom-nft contract
+;; NFT URI management
 (define-public (set-token-uri (token-id uint) (uri (string-ascii 200)))
     (begin
         ;; Authorization check
-        (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-owner) ERR-OWNER-ONLY)
         ;; Validate token exists
-        (asserts! (is-some (nft-get-owner? boom-nft token-id)) ERR-NOT-FOUND)
+        (asserts! (is-some (nft-get-owner? boom-nft token-id)) ERR-NFT-TOKEN-NOT-FOUND)
         ;; Validate URI format
         (asserts! (validate-uri-format uri) ERR-INVALID-URI)
-        ;; Set the URI after validation
+        ;; Set the URI
         (map-set token-uris token-id uri)
         ;; Log the update
         (print {event: "set-token-uri", token-id: token-id, uri: uri})
         (ok true)))
 
-;; NFT management functions
-(define-public (set-nft-contract (nft-contract <nft-trait>) (enabled bool))
+;; NFT contract management
+(define-public (set-nft-contract (contract principal) (enabled bool))
     (begin
-        (asserts! (is-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-owner) ERR-OWNER-ONLY)
         ;; Validate contract principal
-        (asserts! (validate-principal (contract-of nft-contract)) ERR-INVALID-CONTRACT)
-        ;; Set the contract status
-        (map-set nft-contracts (contract-of nft-contract) enabled)
-        ;; Log the action
-        (unwrap! (add-log "set-nft-contract" "NFT contract status updated") ERR-NFT-CONTRACT-UPDATE)
+        (asserts! (not (is-eq contract 'SP000000000000000000002Q6VF78)) ERR-INVALID-CONTRACT)
+        (asserts! (not (is-eq contract (as-contract tx-sender))) ERR-INVALID-CONTRACT)
+        (asserts! (not (is-eq contract contract-owner)) ERR-INVALID-CONTRACT)
+        
+        ;; Set contract status after validation
+        (map-set nft-contracts contract enabled)
+        (unwrap! (add-log "set-nft-contract" "NFT contract updated") ERR-NFT-CONTRACT-UPDATE)
         (ok true)))
 
-(define-public (set-whitelisted-nft-contract (nft-contract <nft-trait>) (enabled bool))
+(define-public (set-product-nft (product-id uint) (nft-contract principal) (token-uri (optional (string-ascii 200))))
     (begin
-        ;; Validate caller is contract owner
-        (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
-        ;; Validate contract is not null
-        (asserts! (not (is-eq (contract-of nft-contract) (as-contract tx-sender))) ERR-INVALID-CONTRACT)
-        ;; Set whitelist status
-        (ok (map-set nft-contracts (contract-of nft-contract) enabled))))
-
-(define-public (set-product-nft (product-id uint) (nft-contract <nft-trait>) (token-uri (optional (string-ascii 200))))
-    (begin
-        (asserts! (can-manage) ERR-NOT-AUTHORIZED)
-        (asserts! (validate-product-id product-id) ERR-INVALID-ID)
+        (asserts! (is-owner) ERR-OWNER-ONLY)
+        (asserts! (validate-id product-id) ERR-INVALID-ID)
+        (asserts! (default-to false (map-get? nft-contracts nft-contract)) ERR-NFT-NOT-WHITELISTED)
         
-        ;; Validate token URI if present
-        (asserts! (match token-uri
-            uri (validate-uri-format uri)
-            true) ERR-INVALID-URI)
+        ;; Validate URI if provided
+        (match token-uri
+            uri (asserts! (validate-uri-format uri) ERR-INVALID-URI-FORMAT)
+            true)
         
-        ;; Check if NFT contract is whitelisted
-        (asserts! (default-to false (map-get? nft-contracts (contract-of nft-contract))) ERR-INVALID-NFT-CONTRACT)
+        ;; Validate contract principal
+        (asserts! (not (is-eq nft-contract 'SP000000000000000000002Q6VF78)) ERR-INVALID-CONTRACT)
+        (asserts! (not (is-eq nft-contract (as-contract tx-sender))) ERR-INVALID-CONTRACT)
+        (asserts! (not (is-eq nft-contract contract-owner)) ERR-INVALID-CONTRACT)
         
-        ;; Set NFT details for product
-        (map-set product-nfts product-id {
-            nft-contract: (contract-of nft-contract),
-            token-uri: token-uri,
-            enabled: true
-        })
-        
-        (unwrap! (add-log "set-nft" "NFT set for product") ERR-LOG-NFT-FAILED)
-        (ok true)))
+        ;; Create validated config tuple
+        (let ((validated-config {
+                nft-contract: nft-contract,
+                token-uri: (match token-uri 
+                    uri (if (validate-uri-format uri) 
+                            (some uri)
+                            none)
+                    none),
+                enabled: true
+            }))
+            
+            ;; Set NFT config after all validations pass
+            (map-set product-nfts product-id validated-config)
+            
+            (unwrap! (add-log "set-product-nft" "NFT config set for product") ERR-NFT-CONFIG-SET-FAILED)
+            (ok true))))
 
 (define-public (disable-product-nft (product-id uint))
     (begin
@@ -816,21 +766,28 @@
         (match (map-get? product-nfts product-id)
             config (begin
                 (map-set product-nfts product-id (merge config {enabled: false}))
-                (unwrap! (add-log "disable-nft" "NFT disabled for product") ERR-LOG-STORE-UPDATE-FAILED)
+                (unwrap! (add-log "disable-nft" "NFT disabled for product") ERR-NFT-DISABLE-FAILED)
                 (ok true))
             ERR-NFT-MINT-FAILED)))
 
-
+(define-public (add-to-product-list (id uint))
+    (let ((current-list (var-get product-ids)))
+        (begin 
+            (asserts! (< (len current-list) u200) ERR-LIST-FULL)
+            (asserts! (validate-id id) ERR-INVALID-ID)
+            (var-set product-ids (unwrap-panic (as-max-len? (append current-list id) u200)))
+            (ok true))))
 
 
 ;; ========== READ-ONLY FUNCTIONS ==========
 (define-read-only (list-products)
-    (ok (fold fold-product (var-get product-ids) (list))))
+    (ok (fold fold-product 
+        (filter is-product-active (var-get product-ids))
+        (list))))
 
 (define-read-only (list-orders)
     (ok (fold fold-order (var-get order-ids) (list))))
 
-;; ========== Queries ==========
 (define-read-only (get-product (id uint))
     (match (map-get? products id)
         product (ok {
@@ -857,38 +814,67 @@
         })
         ERR-ORDER-NOT-FOUND))
 
+(define-read-only (get-order-details (id uint))
+    (match (map-get? orders id)
+        order (ok {
+            id: (get id order),
+            product-id: (get product-id order),
+            quantity: (get quantity order),
+            buyer: (get buyer order),
+            status: (get status order),
+            created-at: (get created-at order),
+            updated-at: (get updated-at order)
+        })
+        ERR-ORDER-NOT-FOUND))
+
 (define-read-only (get-discount (discount-id uint))
     (ok (map-get? discounts discount-id)))
-
-(define-read-only (get-discounted-price (product-id uint) (original-price uint))
-    (let (
-        (discount-data (map-get? discounts u0))  ;; Look up discount ID 0 directly
-    )
-    (match discount-data
-        discount 
-            (if (and 
-                (get active discount)
-                (is-eq product-id (get product-id discount))
-                (>= block-height (get start-block discount))
-                (<= block-height (get end-block discount)))
-                ;; Apply discount - fixed calculation
-                (ok (- original-price (/ (* original-price (get amount discount)) u100)))
-                (ok original-price))
-        (ok original-price))))
-
-;; NFT trait implementation functions
-(define-read-only (get-last-token-id)
-    (ok (var-get last-token-id)))
-
-(define-read-only (get-token-uri (token-id uint))
-    (ok (map-get? token-uris token-id)))
 
 (define-read-only (get-owner (token-id uint))
     (ok (nft-get-owner? boom-nft token-id)))
 
-;; Read-only NFT functions
 (define-read-only (get-product-nft (product-id uint))
-    (map-get? product-nfts product-id))
+    (begin
+        (asserts! (validate-product-id product-id) ERR-INVALID-ID)
+        (ok (unwrap! (map-get? product-nfts product-id) ERR-NFT-NOT-FOUND))))
 
 (define-read-only (is-nft-enabled (product-id uint))
-    (ok (default-to false (get enabled (map-get? product-nfts product-id)))))
+    (begin
+        (asserts! (validate-product-id product-id) ERR-INVALID-ID)
+        (ok (default-to false (get enabled (map-get? product-nfts product-id))))))
+
+(define-read-only (get-last-token-id)
+    (ok (var-get last-token-id)))
+
+(define-read-only (get-token-uri (token-id uint))
+    (begin
+        (asserts! (validate-token-id token-id) ERR-INVALID-TOKEN)
+        (ok (map-get? token-uris token-id))))
+
+(define-read-only (get-last-log)
+    (let ((last-id (- (var-get log-nonce) u1)))
+        (ok (unwrap-panic (map-get? logs last-id)))))
+
+(define-read-only (get-discounted-price (product-id uint))
+    (let (
+        ;; Get product details
+        (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+        (price (get price product))
+        (discount-id (map-get? product-discounts product-id))
+    )
+    (match discount-id
+        id (let ((discount (unwrap! (map-get? discounts id) ERR-DISCOUNT-NOT-FOUND)))
+            (if (and 
+                (get active discount)
+                (>= block-height (get start-block discount))
+                (<= block-height (get end-block discount)))
+                ;; Apply discount if active and within period
+                (let (
+                    (discount-amount (get amount discount))
+                    (discount-value (/ (* price discount-amount) u100))
+                )
+                (ok (- price discount-value)))
+                ;; Return original price if discount not applicable
+                (ok price)))
+        ;; Return original price if no discount exists
+        (ok price))))

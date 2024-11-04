@@ -55,11 +55,6 @@ plan:
             path: contracts/nft-trait.clar
             clarity-version: 2
         - emulated-contract-publish:
-            contract-name: boom-nft
-            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/boom-nft.clar
-            clarity-version: 2
-        - emulated-contract-publish:
             contract-name: smart-shop-trait
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
             path: contracts/smart-shop-trait.clar
@@ -68,5 +63,10 @@ plan:
             contract-name: boom-market
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
             path: contracts/boom-market.clar
+            clarity-version: 2
+        - emulated-contract-publish:
+            contract-name: boom-nft
+            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            path: contracts/boom-nft.clar
             clarity-version: 2
       epoch: "2.5"

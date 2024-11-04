@@ -3,6 +3,7 @@
 
 ;; Storage
 (define-non-fungible-token boom-nft uint)
+(define-map token-uris uint (string-ascii 200))
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -11,6 +12,7 @@
 (define-constant ERR-TOKEN-EXISTS (err u102))
 (define-constant ERR-TOKEN-NOT-FOUND (err u103))
 (define-constant ERR-INVALID-RECIPIENT (err u104))
+(define-constant ERR-INVALID-URI (err u105))
 
 ;; Variables
 (define-data-var last-token-id uint u0)
@@ -34,10 +36,10 @@
 (define-public (get-last-token-id)
     (ok (var-get last-token-id)))
 
-(define-public (get-token-uri (token-id uint))
-    (ok none))
+(define-read-only (get-token-uri (token-id uint))
+    (ok (map-get? token-uris token-id)))
 
-(define-public (get-owner (token-id uint))
+(define-read-only (get-owner (token-id uint))
     (ok (nft-get-owner? boom-nft token-id)))
 
 ;; Mint function - only contract owner can mint
@@ -52,3 +54,26 @@
         ;; Update last token ID
         (var-set last-token-id token-id)
         (ok token-id)))
+
+;; URI management
+(define-public (set-token-uri (token-id uint) (uri (string-ascii 200)))
+    (begin
+        ;; Authorization check
+        (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+        ;; Validate token exists
+        (asserts! (is-some (nft-get-owner? boom-nft token-id)) ERR-TOKEN-NOT-FOUND)
+        ;; Validate URI format
+        (asserts! (validate-uri-format uri) ERR-INVALID-URI)
+        ;; Set the URI after validation
+        (map-set token-uris token-id uri)
+        ;; Log the update
+        (print {event: "set-token-uri", token-id: token-id, uri: uri})
+        (ok true)))
+
+;; Add URI format validation
+(define-private (validate-uri-format (uri (string-ascii 200)))
+    (and 
+        (not (is-eq uri ""))
+        (>= (len uri) u7)
+        (is-eq (slice? uri u0 u7) (some "ipfs://"))
+        (<= (len uri) u200)))
