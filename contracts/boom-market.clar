@@ -81,7 +81,14 @@
 
 ;; Buyer error codes
 (define-constant ERR-INVALID-BUYER (err u403))
-(define-constant ERR-UNAUTHORIZED-BUYER (err u404))
+(define-constant ERR-UNAUTHORIZED-BUYER (err u409))
+
+;; Payment error codes
+(define-constant ERR-PAYMENT-FAILED (err u8000))
+(define-constant ERR-REFUND-FAILED (err u8001))
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u8002))
+(define-constant ERR-WITHDRAWAL-FAILED (err u8003))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u8004))
 
 
 ;; ========== DATA VARIABLES ==========
@@ -110,8 +117,8 @@
 ;; Role Management
 (define-map managers principal bool)
 
-;; Token URI storage
-(define-map token-uris uint (string-ascii 200))
+;; Token URI storage (256 chars to match nft-trait)
+(define-map token-uris uint (string-ascii 256))
 
 ;; Product Management
 (define-map products uint {
@@ -159,7 +166,7 @@
 (define-map nft-contracts principal bool)
 (define-map product-nfts uint {
     nft-contract: principal,
-    token-uri: (optional (string-ascii 200)),
+    token-uri: (optional (string-ascii 256)),
     enabled: bool
 })
 
@@ -350,13 +357,13 @@
             (var-set last-token-id token-id)
             (ok token-id))))
 
-(define-private (validate-uri-format (uri (string-ascii 200)))
+(define-private (validate-uri-format (uri (string-ascii 256)))
     (let ((uri-len (len uri)))
         (and 
             (not (is-eq uri ""))  ;; not empty
             (>= uri-len u7)       ;; min length check
             (is-eq (slice? uri u0 u7) (some "ipfs://"))  ;; starts with ipfs://
-            (<= uri-len u200)     ;; max length check
+            (<= uri-len u256)     ;; max length check
             (> uri-len u7))))  
 
 ;; ========== PUBLIC FUNCTIONS ==========
@@ -498,13 +505,20 @@
         (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
         (order-id (var-get order-nonce))
         (current-block block-height)
+        (base-price (get price product))
+        (discount-id-opt (map-get? product-discounts product-id))
+        (final-price (match discount-id-opt
+            discount-id (apply-discount base-price discount-id)
+            base-price))
+        (total-payment (* final-price quantity))
     )
     (begin
         ;; First validate the product exists and is active
         (asserts! (get active product) ERR-PRODUCT-INACTIVE)
         ;; Then validate other inputs
         (asserts! (validate-id product-id) ERR-INVALID-ID)
-        (asserts! (> quantity u0) ERR-INVALID-QUANTITY)
+        ;; Use validate-quantity for both lower and upper bound check
+        (asserts! (validate-quantity quantity) ERR-INVALID-QUANTITY)
         ;; Validate inventory
         (asserts! (>= (get inventory product) quantity) ERR-INSUFFICIENT-INVENTORY)
         ;; Validate buyer principal
@@ -512,7 +526,10 @@
         ;; Validate tx-sender is buyer
         (asserts! (is-eq tx-sender buyer) ERR-UNAUTHORIZED-BUYER)
         
-        ;; Store order
+        ;; Collect payment from buyer (escrow in contract)
+        (try! (stx-transfer? total-payment buyer (as-contract tx-sender)))
+        
+        ;; Store order with payment info
         (map-set orders order-id {
             id: order-id,
             product-id: product-id,
@@ -533,7 +550,7 @@
             updated-at: current-block
         }))
         
-        (unwrap! (add-log "place-order" "Order placed") ERR-PLACE-ORDER-FAILED)
+        (unwrap! (add-log "place-order" "Order placed with payment") ERR-PLACE-ORDER-FAILED)
         (ok true))))
 
 (define-public (mint-nft-for-order (order-id uint))
@@ -573,16 +590,35 @@
     (let (
         (order (unwrap! (map-get? orders order-id) ERR-NOT-FOUND))
         (current-block block-height)
+        (product-id (get product-id order))
+        (quantity (get quantity order))
+        (buyer (get buyer order))
+        (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+        (base-price (get price product))
+        (discount-id-opt (map-get? product-discounts product-id))
+        (final-price (match discount-id-opt
+            discount-id (apply-discount base-price discount-id)
+            base-price))
+        (refund-amount (* final-price quantity))
     )
     (begin
         ;; Authorization check
         (asserts! (or 
-            (is-eq tx-sender (get buyer order))
+            (is-eq tx-sender buyer)
             (can-manage)
         ) ERR-NOT-AUTHORIZED)
         
         ;; Status validation - can only cancel PENDING orders
         (asserts! (is-eq (get status order) ORDER-STATUS-PENDING) ERR-INVALID-ORDER-STATUS)
+        
+        ;; Refund payment to buyer (from contract escrow)
+        (try! (as-contract (stx-transfer? refund-amount tx-sender buyer)))
+        
+        ;; Restore inventory
+        (map-set products product-id (merge product {
+            inventory: (+ (get inventory product) quantity),
+            updated-at: current-block
+        }))
         
         ;; Update order status with timestamps
         (map-set orders order-id (merge order {
@@ -591,9 +627,32 @@
         }))
         
         ;; Log the cancellation
-        (unwrap! (add-log "cancel-order" "Order cancelled") ERR-CANCEL-ORDER-FAILED)
+        (unwrap! (add-log "cancel-order" "Order cancelled and refunded") ERR-CANCEL-ORDER-FAILED)
         
         (ok true))))
+
+;; ========== Funds Management ==========
+;; Withdraw escrowed funds from contract (owner only)
+(define-public (withdraw-funds (amount uint) (recipient principal))
+    (begin
+        ;; Only owner can withdraw
+        (asserts! (is-owner) ERR-OWNER-ONLY)
+        ;; Validate recipient is not zero address or contract itself
+        (asserts! (not (is-eq recipient 'SP000000000000000000002Q6VF78)) ERR-INVALID-PRINCIPAL)
+        (asserts! (not (is-eq recipient (as-contract tx-sender))) ERR-INVALID-PRINCIPAL)
+        ;; Validate amount
+        (asserts! (> amount u0) ERR-INVALID-PARAMS)
+        ;; Check contract has sufficient balance
+        (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) ERR-INSUFFICIENT-BALANCE)
+        ;; Transfer from contract to recipient
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        ;; Log the withdrawal
+        (unwrap! (add-log "withdraw-funds" "Funds withdrawn from contract") ERR-WITHDRAWAL-FAILED)
+        (ok amount)))
+
+;; Get contract balance (for transparency)
+(define-read-only (get-contract-balance)
+    (ok (stx-get-balance (as-contract tx-sender))))
 
 ;; ========== Discount Management ==========
 (define-public (add-discount (product-id uint) (amount uint) (start-block uint) (end-block uint))
@@ -653,10 +712,9 @@
 (define-public (deactivate-discount (product-id uint))
     (begin
         (asserts! (can-manage) ERR-NOT-AUTHORIZED)
-        (let ((discount-id (map-get? product-discounts product-id)))
-            (asserts! (is-some discount-id) ERR-DISCOUNT-NOT-FOUND)
-            (let ((discount (unwrap! (map-get? discounts (unwrap-panic discount-id)) ERR-DISCOUNT-NOT-FOUND)))
-                (map-set discounts (unwrap-panic discount-id) (merge discount {
+        (let ((discount-id (unwrap! (map-get? product-discounts product-id) ERR-DISCOUNT-NOT-FOUND)))
+            (let ((discount (unwrap! (map-get? discounts discount-id) ERR-DISCOUNT-NOT-FOUND)))
+                (map-set discounts discount-id (merge discount {
                     active: false,
                     updated-at: block-height
                 }))
@@ -697,7 +755,7 @@
             (ok token-id))))
 
 ;; NFT URI management
-(define-public (set-token-uri (token-id uint) (uri (string-ascii 200)))
+(define-public (set-token-uri (token-id uint) (uri (string-ascii 256)))
     (begin
         ;; Authorization check
         (asserts! (is-owner) ERR-OWNER-ONLY)
@@ -725,7 +783,7 @@
         (unwrap! (add-log "set-nft-contract" "NFT contract updated") ERR-NFT-CONTRACT-UPDATE)
         (ok true)))
 
-(define-public (set-product-nft (product-id uint) (nft-contract principal) (token-uri (optional (string-ascii 200))))
+(define-public (set-product-nft (product-id uint) (nft-contract principal) (token-uri (optional (string-ascii 256))))
     (begin
         (asserts! (is-owner) ERR-OWNER-ONLY)
         (asserts! (validate-id product-id) ERR-INVALID-ID)
@@ -770,11 +828,10 @@
                 (ok true))
             ERR-NFT-MINT-FAILED)))
 
-(define-public (add-to-product-list (id uint))
+(define-private (add-to-product-list (id uint))
     (let ((current-list (var-get product-ids)))
         (begin 
             (asserts! (< (len current-list) u200) ERR-LIST-FULL)
-            (asserts! (validate-id id) ERR-INVALID-ID)
             (var-set product-ids (unwrap-panic (as-max-len? (append current-list id) u200)))
             (ok true))))
 
@@ -852,8 +909,11 @@
         (ok (map-get? token-uris token-id))))
 
 (define-read-only (get-last-log)
-    (let ((last-id (- (var-get log-nonce) u1)))
-        (ok (unwrap-panic (map-get? logs last-id)))))
+    (let ((current-nonce (var-get log-nonce)))
+        (if (is-eq current-nonce u0)
+            ERR-NOT-FOUND
+            (let ((last-id (- current-nonce u1)))
+                (ok (unwrap! (map-get? logs last-id) ERR-NOT-FOUND))))))
 
 (define-read-only (get-discounted-price (product-id uint))
     (let (

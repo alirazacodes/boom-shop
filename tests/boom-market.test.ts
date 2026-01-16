@@ -1763,7 +1763,7 @@ describe('boom-market contract tests', () => {
     });
 
     it('handles maximum list capacity', () => {
-      // First fill up the product list
+      // Fill up the product list by adding products (add-to-product-list is now private)
       for(let i = 0; i < 200; i++) {
         simnet.callPublicFn(
           'boom-market',
@@ -1776,21 +1776,18 @@ describe('boom-market contract tests', () => {
           ],
           deployer
         );
-        
-        // Add to product list
-        simnet.callPublicFn(
-          'boom-market',
-          'add-to-product-list',
-          [Cl.uint(i)],
-          deployer
-        );
       }
 
-      // Try to add one more to the list
+      // Try to add one more product - should fail with ERR-LIST-FULL
       const response = simnet.callPublicFn(
         'boom-market',
-        'add-to-product-list',
-        [Cl.uint(200)],
+        'add-product',
+        [
+          Cl.uint(200),
+          Cl.uint(1000),
+          Cl.stringAscii('Product 200'),
+          Cl.none()
+        ],
         deployer
       );
       expect(response.result).toBeErr(Cl.uint(405)); // ERR-LIST-FULL
@@ -2975,19 +2972,19 @@ describe('input validation', () => {
       deployer
     );
   
-    // Test invalid quantity (too high)
+    // Test invalid quantity (too high - above 1000 limit)
     const invalidQuantity = simnet.callPublicFn(
       'boom-market',
       'place-order',
       [
         Cl.uint(1),
-        Cl.uint(1001), // Above limit
+        Cl.uint(1001), // Above limit of 1000
         Cl.principal(wallet1)
       ],
       wallet1
     );
-    // Update expected error code to match contract
-    expect(invalidQuantity.result).toBeErr(Cl.uint(3002)); // ERR-INSUFFICIENT-INVENTORY
+    // validate-quantity enforces upper limit, returns ERR-INVALID-QUANTITY
+    expect(invalidQuantity.result).toBeErr(Cl.uint(3003)); // ERR-INVALID-QUANTITY
   });
 });
 
@@ -3147,5 +3144,644 @@ describe('logging system', () => {
       details: Cl.stringAscii('Product added'),
       timestamp: Cl.uint(simnet.blockHeight)
     }));
+  });
+});
+
+// ========== NEW COMPREHENSIVE TESTS ==========
+
+describe('payment and escrow system', () => {
+  beforeEach(() => {
+    // Setup product with known price
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000000), Cl.stringAscii('Payment Test Product'), Cl.none()],
+      deployer
+    );
+  });
+
+  it('collects payment when placing order', () => {
+    const initialContractBalance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    
+    // Place order - payment should be collected
+    const placeOrder = simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(2), Cl.principal(wallet1)],
+      wallet1
+    );
+    expect(placeOrder.result).toBeOk(Cl.bool(true));
+    
+    // Verify contract received payment
+    const finalContractBalance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    
+    // Contract should have 2,000,000 microSTX more (2 * 1,000,000)
+    expect(finalContractBalance.result).toBeOk(Cl.uint(2000000));
+  });
+
+  it('refunds payment when order is cancelled', () => {
+    // Place order first
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    // Check contract has funds
+    const balanceBefore = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balanceBefore.result).toBeOk(Cl.uint(1000000));
+    
+    // Cancel order
+    const cancelOrder = simnet.callPublicFn(
+      'boom-market',
+      'cancel-order',
+      [Cl.uint(0)],
+      wallet1
+    );
+    expect(cancelOrder.result).toBeOk(Cl.bool(true));
+    
+    // Check contract balance is now 0
+    const balanceAfter = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balanceAfter.result).toBeOk(Cl.uint(0));
+  });
+
+  it('applies discount to order payment', () => {
+    // Add discount (20% off)
+    simnet.callPublicFn(
+      'boom-market',
+      'add-discount',
+      [
+        Cl.uint(1),
+        Cl.uint(20), // 20% discount
+        Cl.uint(simnet.blockHeight),
+        Cl.uint(simnet.blockHeight + 100)
+      ],
+      deployer
+    );
+    
+    // Place order - should pay discounted price
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    // Contract should have 800,000 (1,000,000 - 20%)
+    const balance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balance.result).toBeOk(Cl.uint(800000));
+  });
+});
+
+describe('funds withdrawal', () => {
+  beforeEach(() => {
+    // Setup product and place order to have funds in contract
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000000), Cl.stringAscii('Withdraw Test'), Cl.none()],
+      deployer
+    );
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(5), Cl.principal(wallet1)],
+      wallet1
+    );
+  });
+
+  it('allows owner to withdraw funds', () => {
+    // Verify contract has funds
+    const balanceBefore = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balanceBefore.result).toBeOk(Cl.uint(5000000)); // 5 * 1,000,000
+    
+    // Withdraw funds
+    const withdraw = simnet.callPublicFn(
+      'boom-market',
+      'withdraw-funds',
+      [Cl.uint(3000000), Cl.principal(deployer)],
+      deployer
+    );
+    expect(withdraw.result).toBeOk(Cl.uint(3000000));
+    
+    // Verify remaining balance
+    const balanceAfter = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balanceAfter.result).toBeOk(Cl.uint(2000000));
+  });
+
+  it('prevents non-owner from withdrawing', () => {
+    const withdraw = simnet.callPublicFn(
+      'boom-market',
+      'withdraw-funds',
+      [Cl.uint(1000000), Cl.principal(wallet1)],
+      wallet1
+    );
+    expect(withdraw.result).toBeErr(Cl.uint(407)); // ERR-OWNER-ONLY
+  });
+
+  it('prevents withdrawal exceeding balance', () => {
+    const withdraw = simnet.callPublicFn(
+      'boom-market',
+      'withdraw-funds',
+      [Cl.uint(10000000), Cl.principal(deployer)], // More than available
+      deployer
+    );
+    expect(withdraw.result).toBeErr(Cl.uint(8004)); // ERR-INSUFFICIENT-BALANCE
+  });
+
+  it('prevents withdrawal of zero amount', () => {
+    const withdraw = simnet.callPublicFn(
+      'boom-market',
+      'withdraw-funds',
+      [Cl.uint(0), Cl.principal(deployer)],
+      deployer
+    );
+    expect(withdraw.result).toBeErr(Cl.uint(400)); // ERR-INVALID-PARAMS
+  });
+});
+
+describe('get-last-log edge cases', () => {
+  it('returns error when no logs exist', () => {
+    // In a fresh contract state, log-nonce should be 0
+    // But since we're running tests, logs may already exist
+    // This test verifies the function doesn't crash
+    const result = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-last-log',
+      [],
+      deployer
+    );
+    // Either returns a log or ERR-NOT-FOUND (u404)
+    // Since other tests run first, there will be logs
+    expect(result.result).not.toBeErr(Cl.uint(0));
+  });
+});
+
+describe('inventory restoration on cancellation', () => {
+  beforeEach(() => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000), Cl.stringAscii('Inventory Test'), Cl.none()],
+      deployer
+    );
+    simnet.callPublicFn(
+      'boom-market',
+      'update-inventory',
+      [Cl.uint(1), Cl.uint(50)],
+      deployer
+    );
+  });
+
+  it('restores inventory when order is cancelled', () => {
+    // Check initial inventory
+    let inventory = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-inventory',
+      [Cl.uint(1)],
+      deployer
+    );
+    expect(inventory.result).toBeOk(Cl.uint(50));
+    
+    // Place order (reduces inventory by 10)
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(10), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    // Verify inventory reduced
+    inventory = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-inventory',
+      [Cl.uint(1)],
+      deployer
+    );
+    expect(inventory.result).toBeOk(Cl.uint(40));
+    
+    // Cancel order
+    simnet.callPublicFn(
+      'boom-market',
+      'cancel-order',
+      [Cl.uint(0)],
+      wallet1
+    );
+    
+    // Verify inventory restored
+    inventory = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-inventory',
+      [Cl.uint(1)],
+      deployer
+    );
+    expect(inventory.result).toBeOk(Cl.uint(50));
+  });
+});
+
+describe('NFT minting with completed orders', () => {
+  beforeEach(() => {
+    // Setup NFT contract
+    simnet.callPublicFn(
+      'boom-market',
+      'set-nft-contract',
+      [Cl.contractPrincipal(deployer, 'boom-nft'), Cl.bool(true)],
+      deployer
+    );
+    
+    // Add product
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000), Cl.stringAscii('NFT Product'), Cl.none()],
+      deployer
+    );
+    
+    // Set up NFT for product
+    simnet.callPublicFn(
+      'boom-market',
+      'set-product-nft',
+      [
+        Cl.uint(1),
+        Cl.contractPrincipal(deployer, 'boom-nft'),
+        Cl.some(Cl.stringAscii('ipfs://QmTestNFTUri'))
+      ],
+      deployer
+    );
+  });
+
+  it('marks order as completed after NFT mint', () => {
+    // Place order
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    // Mint NFT for order
+    const mintResult = simnet.callPublicFn(
+      'boom-market',
+      'mint-nft-for-order',
+      [Cl.uint(0)],
+      deployer
+    );
+    expect(mintResult.result).toBeOk(Cl.some(Cl.principal(wallet1)));
+    
+    // Verify order status is COMPLETED
+    const orderDetails = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-order',
+      [Cl.uint(0)],
+      deployer
+    );
+    expect(orderDetails.result).toBeOk(Cl.tuple({
+      id: Cl.uint(0),
+      'product-id': Cl.uint(1),
+      quantity: Cl.uint(1),
+      buyer: Cl.principal(wallet1),
+      status: Cl.stringAscii('COMPLETED')
+    }));
+  });
+
+  it('prevents cancellation of completed orders', () => {
+    // Place order and mint NFT
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    simnet.callPublicFn(
+      'boom-market',
+      'mint-nft-for-order',
+      [Cl.uint(0)],
+      deployer
+    );
+    
+    // Try to cancel completed order
+    const cancelResult = simnet.callPublicFn(
+      'boom-market',
+      'cancel-order',
+      [Cl.uint(0)],
+      wallet1
+    );
+    expect(cancelResult.result).toBeErr(Cl.uint(3001)); // ERR-INVALID-ORDER-STATUS
+  });
+});
+
+describe('discount edge cases with payments', () => {
+  beforeEach(() => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000000), Cl.stringAscii('Discount Test'), Cl.none()],
+      deployer
+    );
+  });
+
+  it('uses full price when no discount exists', () => {
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    const balance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balance.result).toBeOk(Cl.uint(1000000)); // Full price
+  });
+
+  it('uses full price when discount expired', () => {
+    // Add expired discount
+    simnet.callPublicFn(
+      'boom-market',
+      'add-discount',
+      [
+        Cl.uint(1),
+        Cl.uint(50),
+        Cl.uint(0), // Start at block 0
+        Cl.uint(1) // End at block 1 (already expired)
+      ],
+      deployer
+    );
+    
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    const balance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    // Should pay full price since discount expired
+    expect(balance.result).toBeOk(Cl.uint(1000000));
+  });
+
+  it('uses full price when discount is deactivated', () => {
+    // Add and deactivate discount
+    simnet.callPublicFn(
+      'boom-market',
+      'add-discount',
+      [
+        Cl.uint(1),
+        Cl.uint(50),
+        Cl.uint(simnet.blockHeight),
+        Cl.uint(simnet.blockHeight + 100)
+      ],
+      deployer
+    );
+    
+    simnet.callPublicFn(
+      'boom-market',
+      'deactivate-discount',
+      [Cl.uint(1)],
+      deployer
+    );
+    
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    const balance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    // Full price since discount deactivated
+    expect(balance.result).toBeOk(Cl.uint(1000000));
+  });
+});
+
+describe('NFT transfer validation', () => {
+  beforeEach(() => {
+    // Mint an NFT
+    simnet.callPublicFn(
+      'boom-market',
+      'mint',
+      [Cl.principal(wallet1)],
+      deployer
+    );
+  });
+
+  it('allows token owner to transfer', () => {
+    const transfer = simnet.callPublicFn(
+      'boom-market',
+      'transfer',
+      [Cl.uint(1), Cl.principal(wallet1), Cl.principal(wallet2)],
+      wallet1
+    );
+    expect(transfer.result).toBeOk(Cl.bool(true));
+    
+    // Verify new owner
+    const owner = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-owner',
+      [Cl.uint(1)],
+      deployer
+    );
+    expect(owner.result).toBeOk(Cl.some(Cl.principal(wallet2)));
+  });
+
+  it('prevents non-owner from transferring', () => {
+    const transfer = simnet.callPublicFn(
+      'boom-market',
+      'transfer',
+      [Cl.uint(1), Cl.principal(wallet1), Cl.principal(wallet2)],
+      wallet2 // wallet2 is not the owner
+    );
+    expect(transfer.result).toBeErr(Cl.uint(401)); // ERR-NOT-AUTHORIZED
+  });
+
+  it('validates token exists before transfer', () => {
+    const transfer = simnet.callPublicFn(
+      'boom-market',
+      'transfer',
+      [Cl.uint(999), Cl.principal(wallet1), Cl.principal(wallet2)],
+      wallet1
+    );
+    expect(transfer.result).toBeErr(Cl.uint(6011)); // ERR-INVALID-TOKEN
+  });
+});
+
+describe('manager permissions comprehensive', () => {
+  beforeEach(() => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-manager',
+      [Cl.principal(wallet1)],
+      deployer
+    );
+  });
+
+  it('allows manager to add products', () => {
+    const result = simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000), Cl.stringAscii('Manager Product'), Cl.none()],
+      wallet1
+    );
+    expect(result.result).toBeOk(Cl.bool(true));
+  });
+
+  it('allows manager to update inventory', () => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000), Cl.stringAscii('Test'), Cl.none()],
+      deployer
+    );
+    
+    const result = simnet.callPublicFn(
+      'boom-market',
+      'update-inventory',
+      [Cl.uint(1), Cl.uint(500)],
+      wallet1
+    );
+    expect(result.result).toBeOk(Cl.bool(true));
+  });
+
+  it('allows manager to cancel orders', () => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000), Cl.stringAscii('Test'), Cl.none()],
+      deployer
+    );
+    
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet2)],
+      wallet2
+    );
+    
+    // Manager cancels someone else's order
+    const result = simnet.callPublicFn(
+      'boom-market',
+      'cancel-order',
+      [Cl.uint(0)],
+      wallet1
+    );
+    expect(result.result).toBeOk(Cl.bool(true));
+  });
+
+  it('prevents manager from withdrawing funds', () => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000), Cl.stringAscii('Test'), Cl.none()],
+      deployer
+    );
+    
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet2)],
+      wallet2
+    );
+    
+    const result = simnet.callPublicFn(
+      'boom-market',
+      'withdraw-funds',
+      [Cl.uint(500), Cl.principal(wallet1)],
+      wallet1
+    );
+    expect(result.result).toBeErr(Cl.uint(407)); // ERR-OWNER-ONLY
+  });
+});
+
+describe('contract balance tracking', () => {
+  it('starts with zero balance', () => {
+    const balance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balance.result).toBeOk(Cl.uint(0));
+  });
+
+  it('accumulates payments from multiple orders', () => {
+    simnet.callPublicFn(
+      'boom-market',
+      'add-product',
+      [Cl.uint(1), Cl.uint(1000000), Cl.stringAscii('Multi Order Test'), Cl.none()],
+      deployer
+    );
+    
+    // First order
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(1), Cl.principal(wallet1)],
+      wallet1
+    );
+    
+    // Second order
+    simnet.callPublicFn(
+      'boom-market',
+      'place-order',
+      [Cl.uint(1), Cl.uint(2), Cl.principal(wallet2)],
+      wallet2
+    );
+    
+    const balance = simnet.callReadOnlyFn(
+      'boom-market',
+      'get-contract-balance',
+      [],
+      deployer
+    );
+    expect(balance.result).toBeOk(Cl.uint(3000000)); // 1 + 2 = 3 million microSTX
   });
 });

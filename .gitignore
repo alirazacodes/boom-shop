@@ -11,3 +11,8 @@ coverage
 *.info
 costs-reports.json
 node_modules
+
+# Documentation and testing notes (not for production)
+consoletests/
+clarity-notes/
+quviq-testing.pdf
