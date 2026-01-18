@@ -83,12 +83,10 @@
 (define-constant ERR-INVALID-BUYER (err u403))
 (define-constant ERR-UNAUTHORIZED-BUYER (err u409))
 
-;; Payment error codes
+;; Payment error codes (for external payment-hub integration)
 (define-constant ERR-PAYMENT-FAILED (err u8000))
 (define-constant ERR-REFUND-FAILED (err u8001))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u8002))
-(define-constant ERR-WITHDRAWAL-FAILED (err u8003))
-(define-constant ERR-INSUFFICIENT-BALANCE (err u8004))
 
 
 ;; ========== DATA VARIABLES ==========
@@ -388,6 +386,9 @@
         (var-set store-logo logo)
         (var-set store-banner banner)
         
+        ;; Emit event for chainhooks
+        (print {event: "store-updated", name: name, owner: tx-sender})
+        
         ;; Log the update
         (unwrap! (add-log "update-store" "Store information updated") ERR-LOG-STORE-UPDATE-FAILED)
         
@@ -400,6 +401,8 @@
     (asserts! (validate-principal manager) ERR-INVALID-PRINCIPAL)
     (unwrap! (add-log "validate" "Manager validated") ERR-MANAGER-VALIDATION-FAILED)
     (map-set managers manager true)
+    ;; Emit event for chainhooks
+    (print {event: "manager-added", manager: manager, added-by: tx-sender})
     (unwrap! (add-log "add-manager" "Manager added") ERR-MANAGER-ADD-FAILED)
     (ok true)))
 
@@ -409,6 +412,8 @@
         (asserts! (is-owner) ERR-NOT-AUTHORIZED)
         (asserts! (default-to false (map-get? managers manager)) ERR-NOT-FOUND)
         (map-delete managers manager)
+        ;; Emit event for chainhooks
+        (print {event: "manager-removed", manager: manager, removed-by: tx-sender})
         (unwrap! (add-log "remove-manager" "Manager removed") ERR-MANAGER-REMOVE-FAILED)
         (ok true)))
 
@@ -444,6 +449,9 @@
         ;; Add to product list
         (try! (add-to-product-list id))
         
+        ;; Emit event for chainhooks
+        (print {event: "product-added", product-id: id, name: name, price: price, added-by: tx-sender})
+        
         (unwrap! (add-log "add-product" "Product added") ERR-PRODUCT-ADD-FAILED)
         (ok true)))
 
@@ -463,6 +471,8 @@
                 description: description,
                 updated-at: block-height
             }))
+            ;; Emit event for chainhooks
+            (print {event: "product-updated", product-id: id, name: name, price: price, updated-by: tx-sender})
             (unwrap! (add-log "update-product" "Product updated") ERR-PRODUCT-UPDATE-FAILED)
             (ok true))))
 
@@ -477,6 +487,9 @@
                 active: false,
                 updated-at: block-height
             }))
+            
+            ;; Emit event for chainhooks
+            (print {event: "product-removed", product-id: id, removed-by: tx-sender})
             
             ;; Log the action
             (unwrap! (add-log "remove-product" "Product removed") ERR-PRODUCT-REMOVE-FAILED)
@@ -496,6 +509,9 @@
                 updated-at: block-height
             }))
             
+            ;; Emit event for chainhooks
+            (print {event: "inventory-updated", product-id: id, quantity: quantity, updated-by: tx-sender})
+            
             ;; Log the update
             (unwrap! (add-log "update-inventory" "Inventory updated") ERR-INVENTORY-UPDATE-FAILED)
             (ok true))))
@@ -510,7 +526,7 @@
         (final-price (match discount-id-opt
             discount-id (apply-discount base-price discount-id)
             base-price))
-        (total-payment (* final-price quantity))
+        (total-amount (* final-price quantity))
     )
     (begin
         ;; First validate the product exists and is active
@@ -526,10 +542,10 @@
         ;; Validate tx-sender is buyer
         (asserts! (is-eq tx-sender buyer) ERR-UNAUTHORIZED-BUYER)
         
-        ;; Collect payment from buyer (escrow in contract)
-        (try! (stx-transfer? total-payment buyer (as-contract tx-sender)))
+        ;; NOTE: Payment is handled externally via boom-payment-hub
+        ;; This contract only manages order state
         
-        ;; Store order with payment info
+        ;; Store order
         (map-set orders order-id {
             id: order-id,
             product-id: product-id,
@@ -550,7 +566,18 @@
             updated-at: current-block
         }))
         
-        (unwrap! (add-log "place-order" "Order placed with payment") ERR-PLACE-ORDER-FAILED)
+        ;; Emit event for chainhooks (payment-hub integration)
+        (print {
+            event: "order-placed",
+            order-id: order-id,
+            product-id: product-id,
+            quantity: quantity,
+            buyer: buyer,
+            total-amount: total-amount,
+            block-height: current-block
+        })
+        
+        (unwrap! (add-log "place-order" "Order placed") ERR-PLACE-ORDER-FAILED)
         (ok true))))
 
 (define-public (mint-nft-for-order (order-id uint))
@@ -581,6 +608,15 @@
                 updated-at: block-height
             }))
             
+            ;; Emit event for chainhooks
+            (print {
+                event: "nft-minted-for-order",
+                order-id: order-id,
+                token-id: token-id,
+                buyer: buyer,
+                product-id: product-id
+            })
+            
             ;; Log the minting
             (unwrap! (add-log "mint-nft" "NFT minted for order") ERR-MINT-NFT-FAILED)
             
@@ -594,12 +630,6 @@
         (quantity (get quantity order))
         (buyer (get buyer order))
         (product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
-        (base-price (get price product))
-        (discount-id-opt (map-get? product-discounts product-id))
-        (final-price (match discount-id-opt
-            discount-id (apply-discount base-price discount-id)
-            base-price))
-        (refund-amount (* final-price quantity))
     )
     (begin
         ;; Authorization check
@@ -611,8 +641,8 @@
         ;; Status validation - can only cancel PENDING orders
         (asserts! (is-eq (get status order) ORDER-STATUS-PENDING) ERR-INVALID-ORDER-STATUS)
         
-        ;; Refund payment to buyer (from contract escrow)
-        (try! (as-contract (stx-transfer? refund-amount tx-sender buyer)))
+        ;; NOTE: Refunds are handled externally via boom-payment-hub
+        ;; This contract only manages order state
         
         ;; Restore inventory
         (map-set products product-id (merge product {
@@ -626,33 +656,20 @@
             updated-at: current-block
         }))
         
+        ;; Emit event for chainhooks (payment-hub refund integration)
+        (print {
+            event: "order-cancelled",
+            order-id: order-id,
+            product-id: product-id,
+            quantity: quantity,
+            buyer: buyer,
+            cancelled-by: tx-sender
+        })
+        
         ;; Log the cancellation
-        (unwrap! (add-log "cancel-order" "Order cancelled and refunded") ERR-CANCEL-ORDER-FAILED)
+        (unwrap! (add-log "cancel-order" "Order cancelled") ERR-CANCEL-ORDER-FAILED)
         
         (ok true))))
-
-;; ========== Funds Management ==========
-;; Withdraw escrowed funds from contract (owner only)
-(define-public (withdraw-funds (amount uint) (recipient principal))
-    (begin
-        ;; Only owner can withdraw
-        (asserts! (is-owner) ERR-OWNER-ONLY)
-        ;; Validate recipient is not zero address or contract itself
-        (asserts! (not (is-eq recipient 'SP000000000000000000002Q6VF78)) ERR-INVALID-PRINCIPAL)
-        (asserts! (not (is-eq recipient (as-contract tx-sender))) ERR-INVALID-PRINCIPAL)
-        ;; Validate amount
-        (asserts! (> amount u0) ERR-INVALID-PARAMS)
-        ;; Check contract has sufficient balance
-        (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) ERR-INSUFFICIENT-BALANCE)
-        ;; Transfer from contract to recipient
-        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
-        ;; Log the withdrawal
-        (unwrap! (add-log "withdraw-funds" "Funds withdrawn from contract") ERR-WITHDRAWAL-FAILED)
-        (ok amount)))
-
-;; Get contract balance (for transparency)
-(define-read-only (get-contract-balance)
-    (ok (stx-get-balance (as-contract tx-sender))))
 
 ;; ========== Discount Management ==========
 (define-public (add-discount (product-id uint) (amount uint) (start-block uint) (end-block uint))
@@ -680,6 +697,8 @@
             (var-set discount-ids (unwrap! (as-max-len? (append (var-get discount-ids) discount-id) u200) ERR-LIST-FULL))
             ;; Increment nonce
             (var-set discount-nonce (+ discount-id u1))
+            ;; Emit event for chainhooks
+            (print {event: "discount-added", discount-id: discount-id, product-id: product-id, amount: amount, start-block: start-block, end-block: end-block})
             ;; Log addition
             (unwrap! (add-log "add-discount" "Discount added") ERR-DISCOUNT-ADD-FAILED)
             (ok discount-id))))
@@ -705,6 +724,8 @@
                 })))
                 ;; Update discount
                 (map-set discounts discount-id updated-discount)
+                ;; Emit event for chainhooks
+                (print {event: "discount-updated", discount-id: discount-id, amount: amount, end-block: end-block})
                 ;; Log update
                 (unwrap! (add-log "update-discount" "Discount updated") ERR-DISCOUNT-UPDATE-FAILED)
                 (ok true)))))
@@ -715,11 +736,13 @@
         (let ((discount-id (unwrap! (map-get? product-discounts product-id) ERR-DISCOUNT-NOT-FOUND)))
             (let ((discount (unwrap! (map-get? discounts discount-id) ERR-DISCOUNT-NOT-FOUND)))
                 (map-set discounts discount-id (merge discount {
-                    active: false,
-                    updated-at: block-height
-                }))
+                        active: false,
+                        updated-at: block-height
+                    }))
                 ;; Remove product-discount mapping
                 (map-delete product-discounts product-id)
+                ;; Emit event for chainhooks
+                (print {event: "discount-deactivated", discount-id: discount-id, product-id: product-id})
                 (unwrap! (add-log "deactivate-discount" "Discount deactivated") ERR-DISCOUNT-DEACTIVATE-FAILED)
                 (ok true)))))
 
@@ -735,6 +758,8 @@
         (asserts! (is-eq (some sender) (nft-get-owner? boom-nft token-id)) ERR-NOT-TOKEN-OWNER)
         ;; Verify authorization
         (asserts! (is-eq tx-sender sender) ERR-NOT-AUTHORIZED)
+        ;; Emit event for chainhooks
+        (print {event: "nft-transfer", token-id: token-id, sender: sender, recipient: recipient})
         ;; Perform transfer
         (nft-transfer? boom-nft token-id sender recipient)))
 
@@ -750,6 +775,8 @@
             (try! (nft-mint? boom-nft token-id recipient))
             ;; Update last token ID
             (var-set last-token-id token-id)
+            ;; Emit event for chainhooks
+            (print {event: "nft-minted", token-id: token-id, recipient: recipient, minted-by: tx-sender})
             ;; Log the mint
             (unwrap! (add-log "mint-nft" "NFT minted successfully") ERR-NFT-MINT-FAILED)
             (ok token-id))))
@@ -780,6 +807,8 @@
         
         ;; Set contract status after validation
         (map-set nft-contracts contract enabled)
+        ;; Emit event for chainhooks
+        (print {event: "nft-contract-updated", contract: contract, enabled: enabled})
         (unwrap! (add-log "set-nft-contract" "NFT contract updated") ERR-NFT-CONTRACT-UPDATE)
         (ok true)))
 
@@ -813,6 +842,9 @@
             ;; Set NFT config after all validations pass
             (map-set product-nfts product-id validated-config)
             
+            ;; Emit event for chainhooks
+            (print {event: "product-nft-set", product-id: product-id, nft-contract: nft-contract})
+            
             (unwrap! (add-log "set-product-nft" "NFT config set for product") ERR-NFT-CONFIG-SET-FAILED)
             (ok true))))
 
@@ -824,6 +856,8 @@
         (match (map-get? product-nfts product-id)
             config (begin
                 (map-set product-nfts product-id (merge config {enabled: false}))
+                ;; Emit event for chainhooks
+                (print {event: "product-nft-disabled", product-id: product-id})
                 (unwrap! (add-log "disable-nft" "NFT disabled for product") ERR-NFT-DISABLE-FAILED)
                 (ok true))
             ERR-NFT-MINT-FAILED)))
