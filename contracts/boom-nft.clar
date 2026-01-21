@@ -3,7 +3,7 @@
 
 ;; Storage
 (define-non-fungible-token boom-nft uint)
-(define-map token-uris uint (string-ascii 200))
+(define-map token-uris uint (string-ascii 256))
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -56,7 +56,7 @@
         (ok token-id)))
 
 ;; URI management
-(define-public (set-token-uri (token-id uint) (uri (string-ascii 200)))
+(define-public (set-token-uri (token-id uint) (uri (string-ascii 256)))
     (begin
         ;; Authorization check
         (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
@@ -71,9 +71,9 @@
         (ok true)))
 
 ;; Add URI format validation
-(define-private (validate-uri-format (uri (string-ascii 200)))
+(define-private (validate-uri-format (uri (string-ascii 256)))
     (and 
         (not (is-eq uri ""))
         (>= (len uri) u7)
         (is-eq (slice? uri u0 u7) (some "ipfs://"))
-        (<= (len uri) u200)))
+        (<= (len uri) u256)))
